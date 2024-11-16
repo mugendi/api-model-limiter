@@ -496,24 +496,6 @@ const limiter = new RateLimiter(config, {
    - Batch size must be between 1 and maxBatchSize
    - Batch timeout must be positive integer
 
-### Error Handling for Options
-
-The RateLimiter constructor will throw errors for invalid configurations:
-
-```javascript
-try {
-    const limiter = new RateLimiter(config, options);
-} catch (error) {
-    if (error.code === 'INVALID_CONFIG') {
-        // Handle configuration errors
-        console.error('Configuration error:', error.message);
-    } else if (error.code === 'REDIS_ERROR') {
-        // Handle Redis connection errors
-        console.error('Redis error:', error.message);
-    }
-}
-```
-
 ### Dynamic Configuration Updates
 
 Some options can be updated at runtime:
@@ -534,8 +516,6 @@ await limiter.updateLimits('api 1', 'model1', {
 limiter.setBatchSize(8);
 ```
 
-[Rest of the README remains the same...]
-
 ## Error Handling
 
 ```javascript
@@ -551,6 +531,24 @@ try {
 } catch (error) {
   // Handle Redis or other errors
   handleError(error);
+}
+```
+
+### Error Handling for Options
+
+The RateLimiter constructor will throw errors for invalid configurations:
+
+```javascript
+try {
+    const limiter = new RateLimiter(config, options);
+} catch (error) {
+    if (error.code === 'INVALID_CONFIG') {
+        // Handle configuration errors
+        console.error('Configuration error:', error.message);
+    } else if (error.code === 'REDIS_ERROR') {
+        // Handle Redis connection errors
+        console.error('Redis error:', error.message);
+    }
 }
 ```
 
