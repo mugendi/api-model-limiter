@@ -32,6 +32,11 @@ class RateLimiter {
     }
   }
 
+  /** Quit */
+  quit() {
+    this.redis.quit();
+  }
+
   /**
    * Changes the key selection strategy
    */
@@ -272,8 +277,6 @@ class RateLimiter {
 
     return { isWithinLimits, usage, borrowed };
   }
-
-
 
   /**
    * Freezes a key:model combination
