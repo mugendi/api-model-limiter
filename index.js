@@ -13,6 +13,163 @@ class RateLimiter {
       month: 2592000,
       ...options.customWindows,
     };
+
+    // Selection strategies
+    this.keyStrategy = options.keyStrategy || 'ascending';
+    this.modelStrategy = options.modelStrategy || 'ascending';
+
+    // For round-robin tracking
+    this.lastKeyIndices = {};
+    this.lastModelIndices = {};
+
+    // Validate strategies
+    const validStrategies = ['ascending', 'random', 'round-robin'];
+    if (!validStrategies.includes(this.keyStrategy)) {
+      throw new Error(`Invalid key strategy: ${this.keyStrategy}`);
+    }
+    if (!validStrategies.includes(this.modelStrategy)) {
+      throw new Error(`Invalid model strategy: ${this.modelStrategy}`);
+    }
+  }
+
+  /**
+   * Changes the key selection strategy
+   */
+  setKeyStrategy(strategy) {
+    const validStrategies = ['ascending', 'random', 'round-robin'];
+    if (!validStrategies.includes(strategy)) {
+      throw new Error(`Invalid key strategy: ${strategy}`);
+    }
+    this.keyStrategy = strategy;
+  }
+
+  /**
+   * Changes the model selection strategy
+   */
+  setModelStrategy(strategy) {
+    const validStrategies = ['ascending', 'random', 'round-robin'];
+    if (!validStrategies.includes(strategy)) {
+      throw new Error(`Invalid model strategy: ${strategy}`);
+    }
+    this.modelStrategy = strategy;
+  }
+
+  /**
+   * Gets the next round-robin index
+   */
+  getNextRoundRobinIndex(currentIndex, length) {
+    return (currentIndex + 1) % length;
+  }
+
+  /**
+   * Gets a random index
+   */
+  getRandomIndex(length) {
+    return Math.floor(Math.random() * length);
+  }
+
+  /**
+   * Gets ordered items based on strategy
+   */
+  getOrderedItems(items, apiName, type) {
+    const strategy = type === 'key' ? this.keyStrategy : this.modelStrategy;
+    const indices =
+      type === 'key' ? this.lastKeyIndices : this.lastModelIndices;
+
+    switch (strategy) {
+      case 'ascending':
+        return [...items];
+
+      case 'random':
+        const shuffled = [...items];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        return shuffled;
+
+      case 'round-robin':
+        const key = `${apiName}-${type}`;
+        if (!(key in indices)) {
+          indices[key] = -1;
+        }
+        indices[key] = this.getNextRoundRobinIndex(indices[key], items.length);
+        const ordered = [...items];
+        // Reorder array starting from last used index
+        return [
+          ...ordered.slice(indices[key]),
+          ...ordered.slice(0, indices[key]),
+        ];
+
+      default:
+        return [...items];
+    }
+  }
+
+  /**
+   * Gets next available key:model combination with optional borrowing
+   */
+  async getModel(apiName, allowBorrowing = false) {
+    const api = this.findApi(apiName);
+
+    // Get ordered models and keys based on their respective strategies
+    const orderedModels = this.getOrderedItems(api.models, apiName, 'model');
+    const orderedKeys = this.getOrderedItems(api.keys, apiName, 'key');
+
+    for (const model of orderedModels) {
+      for (const key of orderedKeys) {
+        const result = await this.checkAndIncrement(key, model, allowBorrowing);
+
+        if (result.isWithinLimits) {
+          return {
+            key,
+            model: model.name,
+            limits: result.usage,
+            borrowed: result.borrowed,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Gets multiple available key:model combinations at once
+   */
+  async getBatch(apiName, size = this.defaultBatchSize) {
+    const api = this.findApi(apiName);
+    const results = [];
+
+    // Get ordered models and keys based on their respective strategies
+    const orderedModels = this.getOrderedItems(api.models, apiName, 'model');
+    const orderedKeys = this.getOrderedItems(api.keys, apiName, 'key');
+
+    for (const model of orderedModels) {
+      for (const key of orderedKeys) {
+        if (results.length >= size) break;
+
+        const result = await this.checkAndIncrement(key, model);
+        if (result.isWithinLimits) {
+          results.push({
+            key,
+            model: model.name,
+            limits: result.usage,
+            borrowed: result.borrowed,
+          });
+        }
+      }
+    }
+
+    return results.length > 0 ? results : null;
+  }
+
+  /**
+   * Helper to find API configuration
+   */
+  findApi(apiName) {
+    const api = this.apis.find((a) => a.name === apiName);
+    if (!api) throw new Error(`API "${apiName}" not found`);
+    return api;
   }
 
   /**
@@ -21,14 +178,6 @@ class RateLimiter {
   getKey(apiKey, modelName, window) {
     const timestamp = this.getWindowTimestamp(window);
     return `rate:${apiKey}:${modelName}:${window}:${timestamp}`;
-  }
-
-  /**
-   * Gets metric key
-   */
-  getMetricKey(apiKey, modelName, metricType) {
-    const day = this.getWindowTimestamp('day');
-    return `metric:${apiKey}:${modelName}:${metricType}:${day}`;
   }
 
   /**
@@ -52,42 +201,23 @@ class RateLimiter {
   }
 
   /**
-   * Updates metrics for rate limiting events
+   * Checks if a key:model combination is frozen
    */
-  async updateMetrics(apiKey, modelName, type) {
-    if (!this.metricsEnabled) return;
-
-    const key = this.getMetricKey(apiKey, modelName, type);
-    const expiry = this.getWindowExpiry('day');
-
-    await this.redis.pipeline().incr(key).expire(key, expiry).exec();
+  async isFrozen(apiKey, modelName) {
+    const freezeKey = `freeze:${apiKey}:${modelName}`;
+    const result = await this.redis.get(freezeKey);
+    return result !== null;
   }
 
   /**
-   * Gets usage metrics for a key:model combination
-   */
-  async getMetrics(apiKey, modelName) {
-    if (!this.metricsEnabled) return null;
-
-    const types = ['success', 'limit_reached', 'borrowed'];
-    const pipeline = this.redis.pipeline();
-
-    for (const type of types) {
-      pipeline.get(this.getMetricKey(apiKey, modelName, type));
-    }
-
-    const results = await pipeline.exec();
-    return {
-      success: parseInt(results[0][1]) || 0,
-      limitReached: parseInt(results[1][1]) || 0,
-      borrowed: parseInt(results[2][1]) || 0,
-    };
-  }
-
-  /**
-   * Checks and increments rate limits with borrowing option
+   * Checks and increments rate limits for a key:model combination
    */
   async checkAndIncrement(apiKey, model, allowBorrowing = false) {
+    // Check if frozen
+    if (await this.isFrozen(apiKey, model.name)) {
+      return { isWithinLimits: false, usage: {} };
+    }
+
     const pipeline = this.redis.pipeline();
     const limits = model.limits;
     const keys = {};
@@ -138,27 +268,31 @@ class RateLimiter {
         rollback.decr(key);
       }
       await rollback.exec();
-      await this.updateMetrics(apiKey, model.name, 'limit_reached');
-    } else {
-      await this.updateMetrics(
-        apiKey,
-        model.name,
-        borrowed ? 'borrowed' : 'success'
-      );
     }
 
     return { isWithinLimits, usage, borrowed };
+  }
+
+
+
+  /**
+   * Freezes a key:model combination
+   */
+  async freezeModel(apiName, key, modelName, duration) {
+    this.findApi(apiName); // Validate API exists
+    const freezeKey = `freeze:${key}:${modelName}`;
+    await this.redis.set(freezeKey, '1', 'EX', duration);
   }
 
   /**
    * Updates rate limits for a model
    */
   async updateLimits(apiName, modelName, newLimits) {
-    const api = this.apis.find((a) => a.name === apiName);
-    if (!api) throw new Error(`API ${apiName} not found`);
+    const api = this.findApi(apiName);
 
     const model = api.models.find((m) => m.name === modelName);
-    if (!model) throw new Error(`Model ${modelName} not found`);
+    if (!model)
+      throw new Error(`Model ${modelName} not found in API ${apiName}`);
 
     // Validate new limits
     for (const [window, limit] of Object.entries(newLimits)) {
@@ -173,88 +307,85 @@ class RateLimiter {
   }
 
   /**
-   * Gets multiple available key:model combinations at once
+   * Gets the metric key
    */
-  async getBatch(size = this.defaultBatchSize) {
-    const results = [];
-
-    for (const api of this.apis) {
-      for (const model of api.models) {
-        for (const key of api.keys) {
-          if (results.length >= size) break;
-
-          const result = await this.checkAndIncrement(key, model);
-          if (result.isWithinLimits) {
-            results.push({
-              key,
-              model: model.name,
-              limits: result.usage,
-            });
-          }
-        }
-      }
-    }
-
-    return results.length > 0 ? results : null;
+  getMetricKey(apiKey, modelName, type) {
+    const day = this.getWindowTimestamp('day');
+    return `metric:${apiKey}:${modelName}:${type}:${day}`;
   }
 
   /**
-   * Gets next available key:model combination with optional borrowing
+   * Updates metrics for rate limiting events
    */
-  async getModel(allowBorrowing = false) {
-    for (const api of this.apis) {
-      for (const model of api.models) {
-        for (const key of api.keys) {
-          const result = await this.checkAndIncrement(
-            key,
-            model,
-            allowBorrowing
-          );
+  async updateMetrics(apiKey, modelName, type) {
+    if (!this.metricsEnabled) return;
 
-          if (result.isWithinLimits) {
-            return {
-              key,
-              model: model.name,
-              limits: result.usage,
-              borrowed: result.borrowed,
-            };
-          }
-        }
-      }
-    }
-    return null;
+    const key = this.getMetricKey(apiKey, modelName, type);
+    const expiry = this.getWindowExpiry('day');
+
+    await this.redis.pipeline().incr(key).expire(key, expiry).exec();
   }
 
   /**
-   * Freezes a key:model combination
+   * Gets usage metrics for a key:model combination
    */
-  async freezeModel(key, modelName, duration) {
-    const freezeKey = `freeze:${key}:${modelName}`;
-    await this.redis.set(freezeKey, '1', 'EX', duration);
+  async getMetrics(apiName, apiKey, modelName) {
+    this.findApi(apiName); // Validate API exists
+    if (!this.metricsEnabled) return null;
+
+    const types = ['success', 'limit_reached', 'borrowed'];
+    const pipeline = this.redis.pipeline();
+
+    for (const type of types) {
+      pipeline.get(this.getMetricKey(apiKey, modelName, type));
+    }
+
+    const results = await pipeline.exec();
+    return {
+      success: parseInt(results[0][1]) || 0,
+      limitReached: parseInt(results[1][1]) || 0,
+      borrowed: parseInt(results[2][1]) || 0,
+    };
   }
 
   /**
    * Gets current usage statistics
    */
-  async getUsageStats(apiKey, modelName) {
-    const metrics = await this.getMetrics(apiKey, modelName);
+  async getUsageStats(apiName, apiKey, modelName) {
+    const api = this.findApi(apiName);
+    const model = api.models.find((m) => m.name === modelName);
+    if (!model)
+      throw new Error(`Model ${modelName} not found in API ${apiName}`);
+
+    const metrics = await this.getMetrics(apiName, apiKey, modelName);
     const pipeline = this.redis.pipeline();
     const windows = Object.keys(this.customWindows);
 
+    // Get current usage for all windows
     for (const window of windows) {
-      pipeline.get(this.getKey(apiKey, modelName, window));
+      const key = this.getKey(apiKey, modelName, window);
+      pipeline.get(key);
     }
 
     const results = await pipeline.exec();
     const usage = {};
 
+    // Process usage for each window
     windows.forEach((window, i) => {
-      usage[window] = parseInt(results[i][1]) || 0;
+      const count = parseInt(results[i][1]) || 0;
+      usage[window] = {
+        used: count,
+        remaining: model.limits[window]
+          ? Math.max(0, model.limits[window] - count)
+          : null,
+        limit: model.limits[window] || null,
+        reset: this.getWindowExpiry(window),
+      };
     });
 
     return {
       currentUsage: usage,
-      metrics,
+      metrics: this.metricsEnabled ? metrics : null,
     };
   }
 }
