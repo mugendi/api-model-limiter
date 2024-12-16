@@ -24,6 +24,11 @@ denque@^2.1.0:
   resolved "https://registry.yarnpkg.com/denque/-/denque-2.1.0.tgz#e93e1a6569fb5e66f16a3c2a2964617d349d6ab1"
   integrity sha512-HVQE3AAb/pxF8fQAoiqpvg9i3evqug3hoiwakOyZAwJm+6vZehbkYXZ0l4JxS+I3QxM97v5aaRNhj8v5oBhekw==
 
+fastest-validator@^1.19.0:
+  version "1.19.0"
+  resolved "https://registry.yarnpkg.com/fastest-validator/-/fastest-validator-1.19.0.tgz#96f792ce774a81a76efba32974e669c47a2b15eb"
+  integrity sha512-wUfJBrXmccVz4kARAiWTkuqsC6EFeqbNxwfysCDk+maExBPP8KxyBwaWtayrWjKIaBIbaz+rqI2kel6ecayxcg==
+
 ioredis@^5.4.1:
   version "5.4.1"
   resolved "https://registry.yarnpkg.com/ioredis/-/ioredis-5.4.1.tgz#1c56b70b759f01465913887375ed809134296f40"

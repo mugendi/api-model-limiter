@@ -1,11 +1,75 @@
 import Redis from 'ioredis';
+import Validator from 'fastest-validator';
+const v = new Validator();
+
+const configSchema = {
+  $$root: true,
+  type: 'array',
+  items: {
+    type: 'object',
+    props: {
+      name: 'string',
+      keys: {
+        type: 'array',
+        items: 'string',
+      },
+      models: {
+        type: 'array',
+        items: 'array',
+        items: {
+          type: 'object',
+          props: {
+            name: 'string',
+            limits: {
+              type: 'object',
+              minProps: 1,
+              props: {
+                minute: 'number|optional',
+                day: 'number|optional',
+                month: 'number|optional',
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+const optsSchema = {
+  $$root: true,
+  type: 'object',
+  optional: true,
+  default: {},
+  props: {
+    customWindows: 'object|optional',
+    keyPrefix: 'string|optional',
+    redis: 'object|optional',
+    modelStrategy: {
+      type: 'string',
+      optional: true,
+      enum: ['ordered', 'random'],
+    },
+  },
+};
+
+const freezeOptsSchema = {
+  apiName: 'string',
+  key: 'string',
+  model: 'string',
+  duration: 'number',
+};
 
 class RateLimiter {
   constructor(config, options = {}) {
+    config = arrify(config);
+
+    // validate schema
+    validate(configSchema, config);
+    validate(optsSchema, options);
+
     this.redis = new Redis(options.redis);
-    this.apis = config;
-    this.defaultBatchSize = options.batchSize || 3;
-    this.metricsEnabled = options.enableMetrics !== false;
+    this.apis = arrify(config);
     this.customWindows = {
       minute: 60,
       hour: 3600,
@@ -14,16 +78,15 @@ class RateLimiter {
       ...options.customWindows,
     };
 
-    // Selection strategies
-    this.keyStrategy = options.keyStrategy || 'ascending';
-    this.modelStrategy = options.modelStrategy || 'ascending';
+    this.keyPrefix = options.keyPrefix || 'ModelLimiter';
 
-    // For round-robin tracking
-    this.lastKeyIndices = {};
-    this.lastModelIndices = {};
+    // Selection strategies
+    this.keyStrategy = options.keyStrategy || 'ordered';
+    this.modelStrategy = options.modelStrategy || 'ordered';
 
     // Validate strategies
-    const validStrategies = ['ascending', 'random', 'round-robin'];
+    const validStrategies = ['ordered', 'random'];
+
     if (!validStrategies.includes(this.keyStrategy)) {
       throw new Error(`Invalid key strategy: ${this.keyStrategy}`);
     }
@@ -32,364 +95,139 @@ class RateLimiter {
     }
   }
 
-  /** Quit */
-  quit() {
-    this.redis.quit();
-  }
-
-  /**
-   * Changes the key selection strategy
-   */
-  setKeyStrategy(strategy) {
-    const validStrategies = ['ascending', 'random', 'round-robin'];
-    if (!validStrategies.includes(strategy)) {
-      throw new Error(`Invalid key strategy: ${strategy}`);
-    }
-    this.keyStrategy = strategy;
-  }
-
-  /**
-   * Changes the model selection strategy
-   */
-  setModelStrategy(strategy) {
-    const validStrategies = ['ascending', 'random', 'round-robin'];
-    if (!validStrategies.includes(strategy)) {
-      throw new Error(`Invalid model strategy: ${strategy}`);
-    }
-    this.modelStrategy = strategy;
-  }
-
-  /**
-   * Gets the next round-robin index
-   */
-  getNextRoundRobinIndex(currentIndex, length) {
-    return (currentIndex + 1) % length;
-  }
-
-  /**
-   * Gets a random index
-   */
-  getRandomIndex(length) {
-    return Math.floor(Math.random() * length);
-  }
-
-  /**
-   * Gets ordered items based on strategy
-   */
-  getOrderedItems(items, apiName, type) {
-    const strategy = type === 'key' ? this.keyStrategy : this.modelStrategy;
-    const indices =
-      type === 'key' ? this.lastKeyIndices : this.lastModelIndices;
-
-    switch (strategy) {
-      case 'ascending':
-        return [...items];
-
-      case 'random':
-        const shuffled = [...items];
-        for (let i = shuffled.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        return shuffled;
-
-      case 'round-robin':
-        const key = `${apiName}-${type}`;
-        if (!(key in indices)) {
-          indices[key] = -1;
-        }
-        indices[key] = this.getNextRoundRobinIndex(indices[key], items.length);
-        const ordered = [...items];
-        // Reorder array starting from last used index
-        return [
-          ...ordered.slice(indices[key]),
-          ...ordered.slice(0, indices[key]),
-        ];
-
-      default:
-        return [...items];
-    }
-  }
-
   /**
    * Gets next available key:model combination with optional borrowing
    */
-  async getModel(apiName, allowBorrowing = false) {
-    const api = this.findApi(apiName);
+  async getModel(apiName) {
+    // get api
+    let api = this.apis.filter((o) => o.name == apiName)[0];
 
-    // Get ordered models and keys based on their respective strategies
-    const orderedModels = this.getOrderedItems(api.models, apiName, 'model');
-    const orderedKeys = this.getOrderedItems(api.keys, apiName, 'key');
-
-    for (const model of orderedModels) {
-      for (const key of orderedKeys) {
-        const result = await this.checkAndIncrement(key, model, allowBorrowing);
-
-        if (result.isWithinLimits) {
-          return {
-            key,
-            model: model.name,
-            limits: result.usage,
-            borrowed: result.borrowed,
-          };
-        }
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Gets multiple available key:model combinations at once
-   */
-  async getBatch(apiName, size = this.defaultBatchSize) {
-    const api = this.findApi(apiName);
-    const results = [];
-
-    // Get ordered models and keys based on their respective strategies
-    const orderedModels = this.getOrderedItems(api.models, apiName, 'model');
-    const orderedKeys = this.getOrderedItems(api.keys, apiName, 'key');
-
-    for (const model of orderedModels) {
-      for (const key of orderedKeys) {
-        if (results.length >= size) break;
-
-        const result = await this.checkAndIncrement(key, model);
-        if (result.isWithinLimits) {
-          results.push({
-            key,
-            model: model.name,
-            limits: result.usage,
-            borrowed: result.borrowed,
-          });
-        }
-      }
-    }
-
-    return results.length > 0 ? results : null;
-  }
-
-  /**
-   * Helper to find API configuration
-   */
-  findApi(apiName) {
-    const api = this.apis.find((a) => a.name === apiName);
-    if (!api) throw new Error(`API "${apiName}" not found`);
-    return api;
-  }
-
-  /**
-   * Creates a unique Redis key for a specific window
-   */
-  getKey(apiKey, modelName, window) {
-    const timestamp = this.getWindowTimestamp(window);
-    return `rate:${apiKey}:${modelName}:${window}:${timestamp}`;
-  }
-
-  /**
-   * Gets the current timestamp for a specific window
-   */
-  getWindowTimestamp(window) {
-    const now = Math.floor(Date.now() / 1000);
-    const windowSize = this.customWindows[window];
-    if (!windowSize) throw new Error(`Invalid window: ${window}`);
-    return now - (now % windowSize);
-  }
-
-  /**
-   * Gets remaining time in current window
-   */
-  getWindowExpiry(window) {
-    const now = Math.floor(Date.now() / 1000);
-    const windowStart = this.getWindowTimestamp(window);
-    const windowSize = this.customWindows[window];
-    return windowStart + windowSize - now;
-  }
-
-  /**
-   * Checks if a key:model combination is frozen
-   */
-  async isFrozen(apiKey, modelName) {
-    const freezeKey = `freeze:${apiKey}:${modelName}`;
-    const result = await this.redis.get(freezeKey);
-    return result !== null;
-  }
-
-  /**
-   * Checks and increments rate limits for a key:model combination
-   */
-  async checkAndIncrement(apiKey, model, allowBorrowing = false) {
-    // Check if frozen
-    if (await this.isFrozen(apiKey, model.name)) {
-      return { isWithinLimits: false, usage: {} };
-    }
-
-    const pipeline = this.redis.pipeline();
-    const limits = model.limits;
-    const keys = {};
-
-    // Set up all keys and initialize if needed
-    for (const [window, limit] of Object.entries(limits)) {
-      const key = this.getKey(apiKey, model.name, window);
-      const expiry = this.getWindowExpiry(window);
-      keys[window] = { key, limit, expiry };
-
-      pipeline.incr(key);
-      pipeline.expire(key, expiry);
-    }
-
-    // Execute all commands atomically
-    const results = await pipeline.exec();
-    const usage = {};
-    let isWithinLimits = true;
-    let borrowed = false;
-
-    // Process results
-    let i = 0;
-    for (const [window, { key, limit, expiry }] of Object.entries(keys)) {
-      const count = results[i * 2][1];
-
-      usage[window] = {
-        used: count,
-        remaining: Math.max(0, limit - count),
-        limit,
-        reset: expiry,
+    if (!api) {
+      return {
+        key: null,
+        model: null,
       };
+    }
 
-      if (count > limit) {
-        if (allowBorrowing && window !== 'month') {
-          borrowed = true;
-        } else {
-          isWithinLimits = false;
+    let redisKey, modelName, apiKey, validLimits, limitCount, resp;
+    let limits = {};
+    let { keys, models } = api;
+
+    if (this.modelStrategy == 'random') {
+      models = arrayRandom(models);
+    }
+    if (this.keyStrategy == 'random') {
+      keys = arrayRandom(keys);
+    }
+
+    // loop thru models
+    for (let { name: model, limits: modelLimits } of models) {
+      // loop thru all keys
+      for (let key of keys) {
+        apiKey = key;
+
+        validLimits = true;
+
+        let parsedModelLimits = Object.entries(modelLimits)
+          .map(([limit, startCount]) => {
+            return { limit, startCount, duration: this.customWindows[limit] };
+          })
+          .filter((o) => o.duration > 0);
+
+        for (let { limit, startCount, duration } of parsedModelLimits) {
+          redisKey = `${this.keyPrefix}:${apiName}:${key}:${model}:${limit}`;
+
+          // check if key exists and count is zero
+          ({ resp, limitCount } = await this.redis
+            .get(redisKey)
+            .then((resp) => {
+              if (resp !== null) resp = Number(resp);
+              return { limitCount: resp !== null ? resp : startCount, resp };
+            }));
+
+          // console.log({ limit, resp, limitCount });
+
+          limits[limit] = limitCount;
+
+          if (!limitCount) {
+            validLimits = false;
+            break;
+          }
+
+          if (limitCount) {
+            if (!resp && limit in this.customWindows) {
+              await this.redis.setex(redisKey, duration, limitCount);
+            }
+          }
         }
+
+        if (validLimits) break;
       }
 
-      i++;
-    }
-
-    // If we went over limit and couldn't borrow, rollback
-    if (!isWithinLimits) {
-      const rollback = this.redis.pipeline();
-      for (const { key } of Object.values(keys)) {
-        rollback.decr(key);
+      // if valid, set model
+      if (validLimits) {
+        modelName = model;
+        break;
       }
-      await rollback.exec();
     }
 
-    return { isWithinLimits, usage, borrowed };
-  }
+    // decrease model hits
+    if (modelName) {
+      let keyPat = `${this.keyPrefix}:${apiName}:${apiKey}:${modelName}:*`;
+      let affectedKeys = await this.redis.keys(keyPat);
 
-  /**
-   * Freezes a key:model combination
-   */
-  async freezeModel(apiName, key, modelName, duration) {
-    this.findApi(apiName); // Validate API exists
-    const freezeKey = `freeze:${key}:${modelName}`;
-    await this.redis.set(freezeKey, '1', 'EX', duration);
-  }
-
-  /**
-   * Updates rate limits for a model
-   */
-  async updateLimits(apiName, modelName, newLimits) {
-    const api = this.findApi(apiName);
-
-    const model = api.models.find((m) => m.name === modelName);
-    if (!model)
-      throw new Error(`Model ${modelName} not found in API ${apiName}`);
-
-    // Validate new limits
-    for (const [window, limit] of Object.entries(newLimits)) {
-      if (!this.customWindows[window])
-        throw new Error(`Invalid window: ${window}`);
-      if (typeof limit !== 'number' || limit < 0)
-        throw new Error(`Invalid limit for ${window}`);
+      for (let redisKey of affectedKeys) {
+        this.redis.decr(redisKey);
+      }
     }
 
-    model.limits = { ...model.limits, ...newLimits };
-    return model.limits;
-  }
-
-  /**
-   * Gets the metric key
-   */
-  getMetricKey(apiKey, modelName, type) {
-    const day = this.getWindowTimestamp('day');
-    return `metric:${apiKey}:${modelName}:${type}:${day}`;
-  }
-
-  /**
-   * Updates metrics for rate limiting events
-   */
-  async updateMetrics(apiKey, modelName, type) {
-    if (!this.metricsEnabled) return;
-
-    const key = this.getMetricKey(apiKey, modelName, type);
-    const expiry = this.getWindowExpiry('day');
-
-    await this.redis.pipeline().incr(key).expire(key, expiry).exec();
-  }
-
-  /**
-   * Gets usage metrics for a key:model combination
-   */
-  async getMetrics(apiName, apiKey, modelName) {
-    this.findApi(apiName); // Validate API exists
-    if (!this.metricsEnabled) return null;
-
-    const types = ['success', 'limit_reached', 'borrowed'];
-    const pipeline = this.redis.pipeline();
-
-    for (const type of types) {
-      pipeline.get(this.getMetricKey(apiKey, modelName, type));
+    // console.log(modelKeys)
+    if (!modelName) {
+      return {
+        model: modelName,
+        key: apiKey,
+      };
     }
 
-    const results = await pipeline.exec();
     return {
-      success: parseInt(results[0][1]) || 0,
-      limitReached: parseInt(results[1][1]) || 0,
-      borrowed: parseInt(results[2][1]) || 0,
+      key: apiKey,
+      model: modelName,
+      limits: limits,
     };
   }
 
-  /**
-   * Gets current usage statistics
-   */
-  async getUsageStats(apiName, apiKey, modelName) {
-    const api = this.findApi(apiName);
-    const model = api.models.find((m) => m.name === modelName);
-    if (!model)
-      throw new Error(`Model ${modelName} not found in API ${apiName}`);
+  async freezeModel(options) {
+    validate(freezeOptsSchema, options);
+    let { apiName, key, model, duration } = options;
 
-    const metrics = await this.getMetrics(apiName, apiKey, modelName);
-    const pipeline = this.redis.pipeline();
-    const windows = Object.keys(this.customWindows);
+    console.log({ apiName, key, model, duration });
+    let redisKeyPat = `${this.keyPrefix}:${apiName}:${key}:${model}:*`;
+    let allKeys = await this.redis.keys(redisKeyPat);
 
-    // Get current usage for all windows
-    for (const window of windows) {
-      const key = this.getKey(apiKey, modelName, window);
-      pipeline.get(key);
+    for (let redisKey of allKeys) {
+      await this.redis.setex(redisKey, duration, 0);
     }
+  }
+}
 
-    const results = await pipeline.exec();
-    const usage = {};
+function arrayRandom(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
 
-    // Process usage for each window
-    windows.forEach((window, i) => {
-      const count = parseInt(results[i][1]) || 0;
-      usage[window] = {
-        used: count,
-        remaining: model.limits[window]
-          ? Math.max(0, model.limits[window] - count)
-          : null,
-        limit: model.limits[window] || null,
-        reset: this.getWindowExpiry(window),
-      };
-    });
+function arrify(v) {
+  if (v === undefined) return [];
+  return Array.isArray(v) ? v : [v];
+}
 
-    return {
-      currentUsage: usage,
-      metrics: this.metricsEnabled ? metrics : null,
-    };
+function validate(schema, obj) {
+  const check = v.compile(schema);
+  let isValid = check(obj);
+  if (isValid !== true) {
+    throw new Error(isValid[0].message);
   }
 }
 

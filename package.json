@@ -1,10 +1,11 @@
 {
   "name": "api-model-limiter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "main": "index.js",
   "type": "module",
   "license": "MIT",
   "dependencies": {
+    "fastest-validator": "^1.19.0",
     "ioredis": "^5.4.1"
   },
   "description": "A rate limiter to work with multiple api keys and models",
