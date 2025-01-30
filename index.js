@@ -98,7 +98,7 @@ class RateLimiter {
   /**
    * Gets next available key:model combination with optional borrowing
    */
-  async getModel(apiName) {
+  async getModel(apiName, filterModelName = null) {
     // get api
     let api = this.apis.filter((o) => o.name == apiName)[0];
 
@@ -109,7 +109,7 @@ class RateLimiter {
       };
     }
 
-    let redisKey, modelName, apiKey, validLimits, limitCount, resp;
+    let redisKey, modelName, modelMeta, apiKey, validLimits, limitCount, resp;
     let limits = {};
     let { keys, models } = api;
 
@@ -118,6 +118,12 @@ class RateLimiter {
     }
     if (this.keyStrategy == 'random') {
       keys = arrayRandom(keys);
+    }
+
+    if (typeof filterModelName == 'string') {
+      models = models.filter((o) =>
+        o.name.toLowerCase().includes(filterModelName.toLowerCase())
+      );
     }
 
     // loop thru models
@@ -167,6 +173,7 @@ class RateLimiter {
       // if valid, set model
       if (validLimits) {
         modelName = model;
+        modelMeta = meta || null;
         break;
       }
     }
@@ -193,6 +200,7 @@ class RateLimiter {
       key: apiKey,
       model: modelName,
       limits: limits,
+      meta: modelMeta,
     };
   }
 
