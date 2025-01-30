@@ -127,7 +127,7 @@ class RateLimiter {
     }
 
     // loop thru models
-    for (let { name: model, limits: modelLimits } of models) {
+    for (let { name: model, meta, limits: modelLimits } of models) {
       // loop thru all keys
       for (let key of keys) {
         apiKey = key;
